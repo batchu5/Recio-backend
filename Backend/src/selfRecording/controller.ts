@@ -10,7 +10,16 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { PrismaClient } from '../../src/generated/prisma/client.js';
+import { Queue } from "bullmq";
+import {Redis} from "ioredis";
 
+const connection = {
+  url: "redis://default:v8EcmjhJkgBFG7VujXMWUje9BaU2xqb3@redis-12925.c266.us-east-1-3.ec2.cloud.redislabs.com:12925",
+};
+
+// const connection = new Redis("");
+
+export const videoQueue = new Queue("video-processing", {connection: connection});
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
@@ -32,7 +41,6 @@ let urls: string[] = [];
 let screenShareurls: string[] = [];
 
 async function getChunksByPrefix(prefix: string): Promise<string[]> {
-
   console.log("prefix from - msg from getChunksByPrefix", prefix);
   const ids: string[] = [];
   let nextCursor: string | undefined = undefined;
@@ -201,7 +209,7 @@ export async function mergeAndUploadSideBySide(
     });
   });
 
-  console.log("✅ Side-by-side merge complete:", outputPath);
+  console.log("Side-by-side merge complete:", outputPath);
 
   console.log("gonna upload to cloudinary");
 
@@ -211,7 +219,7 @@ export async function mergeAndUploadSideBySide(
       overwrite: true
     });
 
-    console.log("✅ Uploaded final video to Cloudinary:", uploadResult.secure_url);
+    console.log("Uploaded final video to Cloudinary:", uploadResult.secure_url);
     localFiles.forEach((f) => fs.unlinkSync(f));
     fs.unlinkSync(outputPath);
 
@@ -220,106 +228,6 @@ export async function mergeAndUploadSideBySide(
     console.log("Got an error while uploading to the cloudinary", error);
   }
 }
-
-router.post("/get_merged_url", async(req, res) => {
-    const {session_Id, urlF} = req.body;
-    const merged_url = await mergeAndUploadSideBySide(urlF);
-
-    try {
-      await prisma.room.update({
-        where: {
-            id: session_Id
-        },
-        data: {
-          recordings: {
-            create: {
-              url: merged_url!,
-              type: "mixed"
-            }
-          }
-        }
-      })
-    }catch(error){
-      console.log("something is error in uploading the mixed url");
-      res.status(200).json("okay okay, I got error while uploading to the database");
-    }
-    console.log("merged_url is ready", merged_url);
-    res.json({"merged_url": merged_url})
-})
-
-router.post("/get_url", async (req, res) => {
-    const {sessionId} = req.body;
-    console.log("sessionId", sessionId);
-
-    if(!sessionId){
-      console.log("sessionId is null");
-      res.json({"error": "SessionId in null can't proceed"});
-      return;
-    }
-
-    const room = await prisma.room.findUnique({
-      where: { id: sessionId },  
-      include: {
-        participants: true,   
-      },
-    });
-
-    if(!room){
-      console.log("Room is null from get_url");
-      return;
-    }
-   
-    console.log("room participants Data from get_url", room.participants);
-    const participants = room.participants;
-
-    for (let i = 0; i < participants.length; i++) {
-      console.log("participant id in the loop of participants", participants[i]?.email);
-      urls[i] = await mergeAndUpload(`${sessionId}_${participants[i]?.email}_`);
-      screenShareurls[i] = await mergeAndUpload(`${sessionId}_${participants[i]?.email}-screen`)
-    
-
-      if(!urls[i]){
-        console.log(`Urls${i} is null`);
-        continue;
-      }
-      console.log("url at index", i, "is", urls[i]);
-    }
-
-    const pushToDb = await prisma.room.update({
-      where: { id: sessionId },
-      data: {
-        recordings: {
-          create: participants.flatMap((p, i) => {
-            const recs: any[] = [];
-            if (urls[i]) {
-              recs.push({
-                url: urls[i],
-                type: "individual",
-                userId: p.id,
-              });
-            }
-            if (screenShareurls[i]) {
-              recs.push({
-                url: screenShareurls[i],
-                type: "individual-screen",
-                userId: p.id,
-              });
-            }
-            return recs;
-          }),
-        },
-      },
-    });
-
-
-    console.log("pushToDb" , pushToDb);
-    console.log("All URLs:", urls);
-    console.log("screenShareUrls", screenShareurls);
-
-    res.json({"urls": urls, "pushToDb" : pushToDb, "screeShareUrls": screenShareurls});
-
-  }
-)
 
 router.post("/upload_chunk", upload.single("blob"), async(req, res) => {
   const { session_id, participant_id, chunk_index, type} = req.body;
@@ -352,4 +260,31 @@ router.post("/upload_chunk", upload.single("blob"), async(req, res) => {
     }
 
 })
+
+router.post("/start_processing", async (req, res) => {
+  const { sessionId, userEmail } = req.body;
+  console.log("inside the /start_processing");
+
+  if (!sessionId) {
+    return res.status(400).json({ error: "sessionId is required" });
+  }
+
+  try {
+    await videoQueue.add("process-recording", {
+      sessionId,
+      userEmail,
+    });
+
+    console.log("Job added to queue for session:", sessionId);
+
+    res.json({
+      status: "processing",
+      message: "Recording processing started",
+    });
+
+  } catch (error) {
+    console.error("Failed to add job:", error);
+    res.status(500).json({ error: "Failed to start processing" });
+  }
+});
 
